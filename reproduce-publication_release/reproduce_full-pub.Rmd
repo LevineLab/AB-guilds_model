@@ -1,0 +1,1084 @@
+---
+title: Code for manuscript *'Identification of Microbial Metabolic Functional Guilds
+  from Large Genomic Datasets'*
+output:
+  html_document: default
+  pdf_document: default
+---
+
+This script produces the figures and tables in the manuscript (preprint link
+here: [https://www.frontiersin.org/articles/10.3389/fmicb.2023.1197329/full](https://www.frontiersin.org/articles/10.3389/fmicb.2023.1197329/full)).
+
+# Setup
+
+```{r setup, include=TRUE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo=TRUE, eval=TRUE, 
+                      cache = FALSE, warning = FALSE, message = FALSE, cache.lazy = FALSE)
+library(gtools)
+library(dplyr)
+library(magrittr)
+library(gplots)
+library(reshape2)
+library(tidyverse)
+library(vegan)
+library(ggbreak)
+source("aspect_bernoulli.R")
+# source("main-helpers.R")
+
+##' Another helper function to /precisely/ draw the entries of a matrix.
+##' @param mat Matrix of interest.
+##' @param contour If \code{TRUE}, draw a contour using
+##'   \code{lattice::levelplot()}.
+##' @param ... Other arguments to \code{lattice::levelplot()}.
+##'
+##' @return lattice object.
+drawmat_precise <- function(mat, contour = FALSE, ...){
+  
+  if(is.null(colnames(mat))){
+    colnames(mat) <- paste(rep("col\n",ncol(mat)),
+                           c(1:ncol(mat)) , sep=" ")
+  }
+  if(is.null(rownames(mat))){
+    rownames(mat) <- paste(rep("row",nrow(mat)),
+                           c(1:nrow(mat)) , sep=" ")
+  }
+  
+  ## Color function
+  colfun = colorRampPalette(c("blue", "red"))
+  
+  #If need to plot specific boundaries like 0 to 1 use the levels and modify the lattice plot with the following: at=levels
+  levels<-seq(from=0,to=0.8,by=.1)
+  
+  # plot it flipping the axis
+  lattice::levelplot(t(mat[c(nrow(mat):1) , ]),
+                     col.regions = colfun(100),
+                     contour = contour,
+                     ## xaxt = 'n',
+                     las = 2,at=levels,
+                     ...)
+}
+
+mc.cores = 4
+num_steps = 2000
+```
+
+# MAG 10-guild model
+
+This code estimates a 10-guild model from the MAG-only dataset.
+
+```{r mag-model}
+K = 10
+data <- read_csv("Data/MAGonly_data.csv") 
+
+## The following line is a check to see if any of the data columns are full
+## ones, if they are then they can cause the AB to fail and so those functions
+## will be removed (with a text warning flag)
+fullones <- which(colSums(data) == dim(data)[1])
+if(!is_empty(fullones)){
+  data <- data[,-fullones]
+  print(paste("Function(s)",
+              colnames(data)[fullones],
+              "was/were removed because every genome had it (this can cause methodological error)"))
+}
+
+#Set a random seed to use, need to change the RNG kind so that it passes through the aspect bernoulli correctly
+RNGkind("L'Ecuyer-CMRG")
+set.seed(123)
+#Run the Aspect Bernoulli
+fit<-aspect_bernoulli(data,k=K,num_init=10,num_steps=num_steps,em_alg=em_fast,mc.cores=mc.cores)
+dat<-data
+
+#Extract the model which had the highest value for our objective function
+ibest <- fit %>% map_dbl(~ .x$obj[length(.x$obj)]) %>% which.max()
+bestfit = fit[[ibest]]
+
+##Extract the beta and gamma matrices from the best fitting model and format
+beta = bestfit$beta 
+Gamma =  bestfit$gamma
+colnames(beta) <- colnames(dat)
+FF = ncol(beta)
+G = nrow(Gamma)
+K = nrow(beta)
+
+## Add row and column names
+rownames(Gamma) <- 1:G
+colnames(Gamma) <- 1:K
+rownames(beta) <- 1:K
+
+## Calculate guild probabilities
+Vmult = Gamma %*% beta
+guild_prob_all = array(NA, dim = c(G, K, FF))
+for(f in 1:FF){
+  for(g in 1:G){
+    numers_by_guild = Gamma[g,] * beta[,f]
+    denom = Vmult[g,f]
+    if(denom==0) denom = denom + 1E-10
+    ratio = numers_by_guild/denom
+    guild_prob_all[g,,f] = ratio
+  }
+}
+dimnames(guild_prob_all)[[1]] <- 1:G
+dimnames(guild_prob_all)[[2]] <- 1:K
+dimnames(guild_prob_all)[[3]] <- colnames(beta)
+
+guild_prob = guild_prob_all %>% apply(c(2,3), mean)
+dimnames(guild_prob) = dimnames(beta)
+
+## Calculate the unadjusted function scores, q_fk in the main text (Eq. 5)
+numer = guild_prob
+baseline_probs = Gamma %>% colMeans()
+denom = matrix(baseline_probs, nrow=nrow(beta), ncol=ncol(beta), byrow=FALSE)
+stopifnot(dim(numer) == dim(denom))
+score = numer/denom
+
+## Get the top 30 functions in each aspect.
+function_names = colnames(dat)
+num = 30
+inds <- apply(Gamma, 1, function(myrow){ any(myrow > 0.95)})
+mapbacks_guild <- colSums(round(Gamma[inds, ]))
+baseline_probs <- colMeans(Gamma)
+ScoreMat <- matrix(nrow = num, ncol = K, data = 0)
+for(guild in 1:K){
+  ord = score[guild,] %>% order(decreasing = TRUE) %>% head(num)
+  ScoreMat[,guild] <- score[guild, ord]
+}
+```
+
+Next, this code produces **Supplemental Table 5**, which shows the guilds as
+defined by the top 5 functions for the MAG-only dataset.
+
+
+```{r mag-table, results = 'asis'}
+#Establish some variables and empty matrices that we will use to score our final score (see Methods) as well as the mapback genome numbers for our guilds
+MAGData <- dat
+newadjustedscore <- matrix(data = 0, nrow = K, ncol = length(function_names))
+store_mapbacks <- matrix(data = 0, nrow = 0, ncol = 2)
+#Find the maximum Gamma value for each genome, which determines which aspect that genome is a probabilistic representative for (defined in Methods)
+Gamma_maxes <- max.col(Gamma, ties.method = "random")
+avg_fulldata_abundance <- mean(colSums(MAGData))
+
+#This is an optional variable for creating a table of the guilds as defined by the top 5 functions in each aspect
+forpub_guildtables<-matrix(data=NA,nrow=K,ncol=6)
+for (q in 1:dim(Gamma)[2]){
+  reps <- which(Gamma_maxes == q)
+  names(reps) <- c() 
+  #To avoid instances of ties or near ties between two aspects, we remove any genomes from the probabilistic reps list if the maximum Gamma value for that genome falls below 2*(1/K)
+  low_reps <- which(Gamma[reps,q] < (2*(1/K)))
+  if(is_empty(low_reps)==FALSE){
+    reps<-reps[-low_reps]
+  }
+  #Optionally you can print the number of reps discarded, but we have found this number to be 0 or very nearly 0
+  
+  # print(paste("Number of reps discarded is",length(low_reps)))
+                                        # cat("\n")
+  
+  #As described in Equations 5 & 6 in the main text, we need to compute an abundance adjustment factor that promotes functions present in more of the probabilistic reps for a given aspect
+  avg_ingroup_abundance<-mean(colSums(MAGData[reps,]))
+  normalize_repratio<-colSums(MAGData[reps,])/avg_ingroup_abundance
+  newadjustedscore[q,]<-score[q,]*normalize_repratio
+  
+  #This section of code can generate figures to compare pre and post abundance adjusted scores to show that top functions have many more reps after the adjustment
+  
+  # adjust_ord<-newadjustedscore[q,]%>%order(decreasing=TRUE) %>% head(75)
+  # orig_ord<-score[q,]%>%order(decreasing=TRUE) %>% head(75)
+  # 
+  # adjust_repfreq<-colSums(MAGData[reps,adjust_ord])/length(reps)
+  # orig_repfreq<-colSums(MAGData[reps,orig_ord])/length(reps)
+  # freq_df<-as_tibble(cbind(adjust_repfreq,orig_repfreq))
+  # freq_df<-mutate(freq_df,x=c(1:length(orig_ord)))
+  # colnames(freq_df)<-c("Adjusted Score","Original Score","Score Rank")
+  # freq_melt<-freq_df%>%melt(.,id.vars="Score Rank")
+  # colnames(freq_melt)[c(2,3)]<-c("Score Type","Within Rep Abundance")
+  
+  #This line will plot the scatters of the pre and post adjustment scores
+  
+  #print(ggplot(data=freq_melt,aes(x=`Score Rank`,y=`Within Rep Abundance`,color=`Score Type`)) + geom_point())
+  
+  #Save the names and scores in decreasing order for export
+  new_ord<-newadjustedscore[q,] %>% order(decreasing=TRUE) %>% head(20) %>% function_names[.]
+  new_ord_numeric<-newadjustedscore[q,] %>% order(decreasing=TRUE) %>% head(20)
+  top_scores<-newadjustedscore[q,new_ord_numeric]
+  
+  #Optional line to plot the sorted scores as a monotonically decreasing line
+  
+  # plot(newadjustedscore[new_ord_numeric],type="l",xlab="Function",ylab="Score")
+  
+  #Add the current guild (top 5 functions) to the full guild table
+  add_guild<-new_ord[c(1:5)]
+  add_guild<-c(paste("Guild",q),add_guild)
+  forpub_guildtables[q,]<-add_guild
+  
+  #This section of code is optional for generating heatmaps of the presence/absence of the score-ordered functions in the probabilistic reps
+  
+  # repmatrix<-as.matrix(MAGData[reps,new_ord_numeric])
+  # heatmap(repmatrix,Rowv=NA,Colv=NA,scale="none",col=c("blue","red"),main="Within reps frequency")
+  
+  #Generate the information on full mapbacks using definition of guilds as the top 5 scoring functions
+  mapback_num<-5
+  mapback_func<-new_ord_numeric %>% head(mapback_num)
+  #Comparing number of mapbacks between probabilistic reps and full dataset
+  full_mapbacks<-which(rowSums(MAGData[reps,mapback_func])==mapback_num)
+  alldata_mapbacks<-which(rowSums(MAGData[,mapback_func])==mapback_num)
+  
+  store_mapbacks<-rbind(store_mapbacks,c(length(full_mapbacks),length(alldata_mapbacks)))
+}
+
+guildtables_MAG_df <- as.data.frame(forpub_guildtables)
+knitr::kable(guildtables_MAG_df,
+             col.names = rep("", 6),
+             caption = "Supplemental Table 5: Guilds for the MAG-only dataset as defined by the top 5 functions in each aspect")
+```
+
+
+# SAG only dataset
+
+Next, this code estimates a 10-guild model for the SAG-only dataset.
+
+
+```{r sag-only}
+data<-read_csv("Data/SAGData_Complete70.csv") #%>% as.matrix()
+#Now need to run Aspect Bernoulli on this new dataset
+#The following line is a check to see if any of the data columns are full ones, if they are then they can cause the AB to fail and so those functions will be removed (with a text warning flag)
+fullones<-which(colSums(data)==dim(data)[1])
+if (is_empty(fullones)==FALSE){
+  data<-data[,-fullones]
+  print(paste("Function(s)",colnames(data)[fullones],"was/were removed because every genome had it (this can cause methodological error)"))
+}
+
+#Set a random seed to use, need to change the RNG kind so that it passes through the aspect bernoulli correctly
+RNGkind("L'Ecuyer-CMRG")
+set.seed(123)
+#Run the Aspect Bernoulli
+fit<-aspect_bernoulli(data,k=K,num_init=10,num_steps=num_steps,em_alg=em_fast,mc.cores=mc.cores)
+dat<-data
+
+#Extract the model which had the highest value for our objective function
+ibest <- fit %>% map_dbl(~ .x$obj[length(.x$obj)]) %>% which.max()
+bestfit = fit[[ibest]]
+
+##Extract the beta and gamma matrices from the best fitting model and format
+beta = bestfit$beta 
+Gamma =  bestfit$gamma
+colnames(beta) <- colnames(dat)
+FF = ncol(beta)
+G = nrow(Gamma)
+K = nrow(beta)
+
+## Add row and column names
+rownames(Gamma) <- 1:G
+colnames(Gamma) <- 1:K
+rownames(beta) <- 1:K
+
+## Calculate guild probabilities
+Vmult = Gamma %*% beta
+guild_prob_all = array(NA, dim = c(G, K, FF))
+for(f in 1:FF){
+  for(g in 1:G){
+    numers_by_guild = Gamma[g,] * beta[,f]
+    denom = Vmult[g,f]
+    if(denom==0) denom = denom + 1E-10
+    ratio = numers_by_guild/denom
+    guild_prob_all[g,,f] = ratio
+  }
+}
+dimnames(guild_prob_all)[[1]] <- 1:G
+dimnames(guild_prob_all)[[2]] <- 1:K
+dimnames(guild_prob_all)[[3]] <- colnames(beta)
+
+guild_prob = guild_prob_all %>% apply(c(2,3), mean)
+dimnames(guild_prob) = dimnames(beta)
+
+## Calculate the unadjusted function scores, q_fk in the main text (Eq. 5)
+numer = guild_prob
+baseline_probs = Gamma %>% colMeans()
+denom = matrix(baseline_probs, nrow=nrow(beta), ncol=ncol(beta), byrow=FALSE)
+stopifnot(dim(numer) == dim(denom))
+score = numer/denom
+
+## Get the top 30 functions in each aspect.
+function_names = colnames(dat)
+num = 30
+inds <- apply(Gamma, 1, function(myrow){ any(myrow > 0.95)})
+mapbacks_guild <- colSums(round(Gamma[inds, ]))
+baseline_probs <- colMeans(Gamma)
+ScoreMat <- matrix(nrow = num, ncol = K, data = 0)
+for(guild in 1:K){
+  ord = score[guild,] %>% order(decreasing = TRUE) %>% head(num)
+  ScoreMat[,guild] <- score[guild, ord]
+}
+```
+
+Next, the code produces **Supplemental Table 6**, which shows the guilds as
+defined by the top 5 functions for the SAG-only dataset.
+
+```{r sag-table, results="asis"}
+#--------------------------------------------------------------------------------------------------------------#
+#Establish some variables and empty matrices that we will use to score our final score (see Methods) as well as the mapback genome numbers for our guilds
+MAGData <- dat
+newadjustedscore <- matrix(data = 0, nrow = K, ncol = length(function_names))
+store_mapbacks <- matrix(data = 0, nrow = 0, ncol = 2)
+#Find the maximum Gamma value for each genome, which determines which aspect that genome is a probabilistic representative for (defined in Methods)
+Gamma_maxes <- max.col(Gamma, ties.method = "random")
+avg_fulldata_abundance <- mean(colSums(MAGData))
+
+#This is an optional variable for creating a table of the guilds as defined by the top 5 functions in each aspect
+forpub_guildtables<-matrix(data=NA,nrow=K,ncol=6)
+for (q in 1:dim(Gamma)[2]){
+  reps <- which(Gamma_maxes == q)
+  names(reps) <- c() 
+  #To avoid instances of ties or near ties between two aspects, we remove any genomes from the probabilistic reps list if the maximum Gamma value for that genome falls below 2*(1/K)
+  low_reps <- which(Gamma[reps,q] < (2*(1/K)))
+  if(is_empty(low_reps)==FALSE){
+    reps<-reps[-low_reps]
+  }
+  #Optionally you can print the number of reps discarded, but we have found this number to be 0 or very nearly 0
+  
+  # print(paste("Number of reps discarded is",length(low_reps)))
+                                        # cat("\n")
+  
+  #As described in Equations 5 & 6 in the main text, we need to compute an abundance adjustment factor that promotes functions present in more of the probabilistic reps for a given aspect
+  avg_ingroup_abundance<-mean(colSums(MAGData[reps,]))
+  normalize_repratio<-colSums(MAGData[reps,])/avg_ingroup_abundance
+  newadjustedscore[q,]<-score[q,]*normalize_repratio
+  
+  #This section of code can generate figures to compare pre and post abundance adjusted scores to show that top functions have many more reps after the adjustment
+  
+  # adjust_ord<-newadjustedscore[q,]%>%order(decreasing=TRUE) %>% head(75)
+  # orig_ord<-score[q,]%>%order(decreasing=TRUE) %>% head(75)
+  # 
+  # adjust_repfreq<-colSums(MAGData[reps,adjust_ord])/length(reps)
+  # orig_repfreq<-colSums(MAGData[reps,orig_ord])/length(reps)
+  # freq_df<-as_tibble(cbind(adjust_repfreq,orig_repfreq))
+  # freq_df<-mutate(freq_df,x=c(1:length(orig_ord)))
+  # colnames(freq_df)<-c("Adjusted Score","Original Score","Score Rank")
+  # freq_melt<-freq_df%>%melt(.,id.vars="Score Rank")
+  # colnames(freq_melt)[c(2,3)]<-c("Score Type","Within Rep Abundance")
+  
+  #This line will plot the scatters of the pre and post adjustment scores
+  
+  #print(ggplot(data=freq_melt,aes(x=`Score Rank`,y=`Within Rep Abundance`,color=`Score Type`)) + geom_point())
+  
+  #Save the names and scores in decreasing order for export
+  new_ord<-newadjustedscore[q,] %>% order(decreasing=TRUE) %>% head(20) %>% function_names[.]
+  new_ord_numeric<-newadjustedscore[q,] %>% order(decreasing=TRUE) %>% head(20)
+  top_scores<-newadjustedscore[q,new_ord_numeric]
+  
+  #Optional line to plot the sorted scores as a monotonically decreasing line
+  
+  # plot(newadjustedscore[new_ord_numeric],type="l",xlab="Function",ylab="Score")
+  
+  #Add the current guild (top 5 functions) to the full guild table
+  add_guild<-new_ord[c(1:5)]
+  add_guild<-c(paste("Guild",q),add_guild)
+  forpub_guildtables[q,]<-add_guild
+  
+  #This section of code is optional for generating heatmaps of the presence/absence of the score-ordered functions in the probabilistic reps
+  
+  # repmatrix<-as.matrix(MAGData[reps,new_ord_numeric])
+  # heatmap(repmatrix,Rowv=NA,Colv=NA,scale="none",col=c("blue","red"),main="Within reps frequency")
+  
+  #Generate the information on full mapbacks using definition of guilds as the top 5 scoring functions
+  mapback_num<-5
+  mapback_func<-new_ord_numeric %>% head(mapback_num)
+  #Comparing number of mapbacks between probabilistic reps and full dataset
+  full_mapbacks<-which(rowSums(MAGData[reps,mapback_func])==mapback_num)
+  alldata_mapbacks<-which(rowSums(MAGData[,mapback_func])==mapback_num)
+  
+  store_mapbacks<-rbind(store_mapbacks,c(length(full_mapbacks),length(alldata_mapbacks)))
+}
+#Create a dataframe of the guild tables for printing out
+guildtables_SAG_df<-as.data.frame(forpub_guildtables)
+knitr::kable(guildtables_SAG_df,
+             col.names=rep("",6),
+             caption = "Supplemental Table 6: Guilds for the SAG-only dataset as defined by the top 5 functions in each aspect")
+```
+
+# Artificial Datasets
+
+Now we are going to deal with the figures from the simulated data, loading
+pre-made dataframes since it is impractical to rerun these. Load in the data
+objects for the simulation data to regenerate plots.
+
+```{r simulated-data, fig.width=10, fig.height=6, fig.fullwidth=TRUE}
+#First we'll do the single guild simulations, loading the data
+load("Data/oneguild_melt.Rda")
+#Now run the plot command to generate plot
+print("Supplemental Figure 2:")
+print(ggplot(oneguild_melt,aes(x=`Value of K`,y=`Frequency`,color=`Guild Parameters`))+geom_line(linewidth = 1)+scale_x_continuous(breaks=seq(5,20,by=2))+ggtitle("One Simulated Guild")+theme(plot.title=element_text(hjust=0.5),legend.position="bottom",legend.box="vertical",legend.title = element_text(size = 9),legend.text = element_text(size =9), axis.text = element_text(size =9), axis.title = element_text(size =9), strip.text = element_text(size =9), strip.background = element_blank(), panel.background = element_blank(), panel.border = element_rect(fill = NA, color = "black"), panel.grid.major = element_line(color = "gray92"),panel.grid.minor=element_line(color="gray92"))+facet_grid(factor(Metric,levels=c("Hit Rate (Proportion)","Extra Hits","Multi Hits")) ~ .,scales="free")+ylab("")+scale_x_continuous(expand = c(0,0))+guides(color=guide_legend(ncol=2,byrow=TRUE)))
+
+#Now load the three guild simulations with non-overlapping insertion
+load("Data/threeguild_melt.Rda")
+#Now plot
+print("Figure 2/Supplemental Figure 1:")
+print(ggplot(threeguild_melt,aes(x=`Value of K`,y=`Frequency`,color=`Guild Parameters`))+geom_line(linewidth = 1)+scale_x_continuous(breaks=seq(5,20,by=2))+ggtitle("Three Simulated Guilds (Non-Overlapping Insertion)")+theme(plot.title=element_text(hjust=0.5),legend.position="bottom",legend.box="vertical",legend.title = element_text(size = 9),legend.text = element_text(size =9), axis.text = element_text(size =9), axis.title = element_text(size =9), strip.text = element_text(size =9), strip.background = element_blank(), panel.background = element_blank(), panel.border = element_rect(fill = NA, color = "black"), panel.grid.major = element_line(color = "gray92"),panel.grid.minor=element_line(color="gray92"))+facet_grid(factor(Metric,levels=c("Hit Rate (Proportion)","Extra Hits","Multi Hits")) ~ .,scales="free")+ylab("")+scale_x_continuous(expand = c(0,0))+guides(color=guide_legend(ncol=2,byrow=TRUE)))
+
+#Now load the three guild simulations with random insertion
+load("Data/randomguild_melt.Rda")
+#Now plot
+print("Supplemental Figure 3:")
+print(ggplot(randomguild_melt,aes(x=`Value of K`,y=`Frequency`,color=`Guild Parameters`))+geom_line(linewidth = 1)+scale_x_continuous(breaks=seq(5,20,by=2))+ggtitle("Three Simulated Guilds (Random Insertion)")+theme(plot.title=element_text(hjust=0.5),legend.position="bottom",legend.box="vertical",legend.title = element_text(size = 9),legend.text = element_text(size =9), axis.text = element_text(size =9), axis.title = element_text(size =9), strip.text = element_text(size =9), strip.background = element_blank(), panel.background = element_blank(), panel.border = element_rect(fill = NA, color = "black"), panel.grid.major = element_line(color = "gray92"),panel.grid.minor=element_line(color="gray92"))+facet_grid(factor(Metric,levels=c("Hit Rate (Proportion)","Extra Hits","Multi Hits")) ~ .,scales="free")+ylab("")+scale_x_continuous(expand = c(0,0))+guides(color=guide_legend(ncol=2,byrow=TRUE)))
+
+#We also want to make the main text figure without the Multi Hits for three non-overlapping guilds
+threeguild_nomulti<-threeguild_melt[1:128,]
+print("Figure 2: Hit Rate and Extra Hits for three guilds inserted in a non-overlapping manner:")
+print(ggplot(threeguild_nomulti,aes(x=`Value of K`,y=`Frequency`,color=`Guild Parameters`))+geom_line(linewidth = 1)+scale_x_continuous(breaks=seq(5,20,by=2))+ggtitle("Three Simulated Guilds (Non-Overlapping Insertion)")+theme(plot.title=element_text(hjust=0.5),legend.position="bottom",legend.box="vertical",legend.title = element_text(size = 9),legend.text = element_text(size =9), axis.text = element_text(size =9), axis.title = element_text(size =9), strip.text = element_text(size =9), strip.background = element_blank(), panel.background = element_blank(), panel.border = element_rect(fill = NA, color = "black"), panel.grid.major = element_line(color = "gray92"),panel.grid.minor=element_line(color="gray92"))+facet_grid(factor(Metric,levels=c("Hit Rate (Proportion)","Extra Hits","Multi Hits")) ~ .,scales="free")+ylab("")+scale_x_continuous(expand = c(0,0))+guides(color=guide_legend(ncol=2,byrow=TRUE)))
+```
+
+Now we will run the 10-guild model for the composite dataset presented in the main text of the publication.
+
+```{r Composite-Data}
+##Running the AB on our composite dataset
+data<-read_csv("Data/MAGData.csv") #%>% as.matrix()
+#Now need to run Aspect Bernoulli on this new dataset
+#The following line is a check to see if any of the data columns are full ones, if they are then they can cause the AB to fail and so those functions will be removed (with a text warning flag)
+fullones<-which(colSums(data)==dim(data)[1])
+if (is_empty(fullones)==FALSE){
+  data<-data[,-fullones]
+  print(paste("Function(s)",colnames(data)[fullones],"was/were removed because every genome had it (this can cause methodological error)"))
+}
+
+#Set a random seed to use, need to change the RNG kind so that it passes through the aspect bernoulli correctly
+RNGkind("L'Ecuyer-CMRG")
+set.seed(123)
+#Run the Aspect Bernoulli
+fit<-aspect_bernoulli(data,k=K,num_init=10,num_steps=num_steps,em_alg=em_fast,mc.cores=mc.cores)
+dat<-data
+
+#Extract the model which had the highest value for our objective function
+ibest <- fit %>% map_dbl(~ .x$obj[length(.x$obj)]) %>% which.max()
+bestfit = fit[[ibest]]
+
+##Extract the beta and gamma matrices from the best fitting model and format
+beta = bestfit$beta 
+Gamma =  bestfit$gamma
+colnames(beta) <- colnames(dat)
+FF = ncol(beta)
+G = nrow(Gamma)
+K = nrow(beta)
+
+## Add row and column names
+rownames(Gamma) <- 1:G
+colnames(Gamma) <- 1:K
+rownames(beta) <- 1:K
+
+## Calculate guild probabilities
+Vmult = Gamma %*% beta
+guild_prob_all = array(NA, dim = c(G, K, FF))
+for(f in 1:FF){
+  for(g in 1:G){
+    numers_by_guild = Gamma[g,] * beta[,f]
+    denom = Vmult[g,f]
+    if(denom==0) denom = denom + 1E-10
+    ratio = numers_by_guild/denom
+    guild_prob_all[g,,f] = ratio
+  }
+}
+dimnames(guild_prob_all)[[1]] <- 1:G
+dimnames(guild_prob_all)[[2]] <- 1:K
+dimnames(guild_prob_all)[[3]] <- colnames(beta)
+
+guild_prob = guild_prob_all %>% apply(c(2,3), mean)
+dimnames(guild_prob) = dimnames(beta)
+
+## Calculate the unadjusted function scores, q_fk in the main text (Eq. 5)
+numer = guild_prob
+baseline_probs = Gamma %>% colMeans()
+denom = matrix(baseline_probs, nrow=nrow(beta), ncol=ncol(beta), byrow=FALSE)
+stopifnot(dim(numer) == dim(denom))
+score = numer/denom
+
+## Get the top 30 functions in each aspect.
+function_names = colnames(dat)
+# num = 30
+# inds <- apply(Gamma, 1, function(myrow){ any(myrow > 0.95)})
+# mapbacks_guild <- colSums(round(Gamma[inds, ]))
+# baseline_probs <- colMeans(Gamma)
+# ScoreMat <- matrix(nrow = num, ncol = K, data = 0)
+# for(guild in 1:K){
+#   ord = score[guild,] %>% order(decreasing = TRUE) %>% head(num)
+#   ScoreMat[,guild] <- score[guild, ord]
+# }
+```
+
+# Composite Dataset
+
+Now, the code produces **Supplemental Table 4**, which shows the guilds as
+defined by the top 5 functions for the composite dataset as well as **Figure 1** showing the unadjusted vs adjusted score, **Figure 2** showing the mapback lines, and **Table 1** in the main text showing the **DMSP** and **motility** guilds.
+
+```{r composite-figs-and-tables, results="asis", fig.width=10, fig.height=6, fig.fullwidth=TRUE}
+
+#--------------------------------------------------------------------------------------------------------------#
+
+#Establish some variables and empty matrices that we will use to score our final score (see Methods) as well as the mapback genome numbers for our guilds
+MAGData <- dat
+newadjustedscore <- matrix(data = 0, nrow = K, ncol = length(function_names))
+store_mapbacks <- matrix(data = 0, nrow = 0, ncol = 2)
+#Find the maximum Gamma value for each genome, which determines which aspect that genome is a probabilistic representative for (defined in Methods)
+Gamma_maxes <- max.col(Gamma, ties.method = "random")
+avg_fulldata_abundance <- mean(colSums(MAGData))
+mapback_list<-list()
+
+#This is an optional variable for creating a table of the guilds as defined by the top 5 functions in each aspect
+forpub_guildtables<-matrix(data=NA,nrow=K,ncol=6)
+for (q in 1:dim(Gamma)[2]){
+  reps <- which(Gamma_maxes == q)
+  names(reps) <- c() 
+  #To avoid instances of ties or near ties between two aspects, we remove any genomes from the probabilistic reps list if the maximum Gamma value for that genome falls below 2*(1/K)
+  low_reps <- which(Gamma[reps,q] < (2*(1/K)))
+  if(is_empty(low_reps)==FALSE){
+    reps<-reps[-low_reps]
+  }
+  #Optionally you can print the number of reps discarded, but we have found this number to be 0 or very nearly 0
+  
+  # print(paste("Number of reps discarded is",length(low_reps)))
+                                        # cat("\n")
+  
+  #As described in Equations 5 & 6 in the main text, we need to compute an abundance adjustment factor that promotes functions present in more of the probabilistic reps for a given aspect
+  avg_ingroup_abundance<-mean(colSums(MAGData[reps,]))
+  normalize_repratio<-colSums(MAGData[reps,])/avg_ingroup_abundance
+  newadjustedscore[q,]<-score[q,]*normalize_repratio
+  
+  #This section of code can generate figures to compare pre and post abundance adjusted scores to show that top functions have many more reps after the adjustment
+  my.expressions=expression('s'['fk'],'r'['fk'])
+
+  adjust_ord<-newadjustedscore[q,]%>%order(decreasing=TRUE) %>% head(75)
+  orig_ord<-score[q,]%>%order(decreasing=TRUE) %>% head(75)
+
+  adjust_repfreq<-colSums(MAGData[reps,adjust_ord])/length(reps)
+  orig_repfreq<-colSums(MAGData[reps,orig_ord])/length(reps)
+  freq_df<-as_tibble(cbind(adjust_repfreq,orig_repfreq))
+  freq_df<-mutate(freq_df,x=c(1:length(orig_ord)))
+  colnames(freq_df)<-paste(c(my.expressions,"Score Rank"))
+  freq_melt<-freq_df%>%melt(.,id.vars="Score Rank")
+  colnames(freq_melt)[c(2,3)]<-c("Score Metric","Within Rep Abundance")
+  
+  #This line will plot the scatters of the pre and post adjustment scores
+  
+  #print(ggplot(data=freq_melt,aes(x=`Score Rank`,y=`Within Rep Abundance`,color=`Score Type`)) + geom_point())
+  
+  #For viewing all aspects, the above line is recommended, but we are manually checking that we are in the aspect that is used for the score comparison plot in the publication (Figure 1) and re-plotting it here
+  if (q==2){
+    print("Figure 1: Scatter plot of unadjusted score vs adjusted score for one the aspects in the 10-guild model")
+    
+    title_expression=expression("Effect of q"['fk']*" on the rank abundances of s"['fk']*" compared to r"['fk'])
+    score_plot<-ggplot(data=freq_melt,aes(x=`Score Rank`,y=`Within Rep Abundance`,color=`Score Metric`)) + 
+     geom_point(size=0.5) + 
+     theme(legend.position="bottom") + 
+     ggtitle(title_expression) + 
+     scale_color_discrete(breaks=waiver(),labels=my.expressions) + 
+     theme(legend.text=element_text(size=rel(1.2))) + 
+     facet_grid(factor(freq_melt$`Score Metric`,levels=c("\"r\"[\"fk\"]","\"s\"[\"fk\"]")))+
+     theme(strip.text.y = element_blank(), plot.title = element_text(hjust=0.5,size=8),legend.title=element_text(size=8),legend.text=element_text(size=8),axis.text=element_text(size=8),axis.title=element_text(size=8),panel.background=element_blank(),panel.border=element_rect(fill=NA,color="black"),panel.grid.major=element_line(color="gray92"),panel.grid.minor=element_line(color="gray92"),legend.key=element_rect(fill=NA))
+    print(score_plot)
+  }
+  
+  #Save the names and scores in decreasing order for export
+  new_ord<-newadjustedscore[q,] %>% order(decreasing=TRUE) %>% head(20) %>% function_names[.]
+  new_ord_numeric<-newadjustedscore[q,] %>% order(decreasing=TRUE) %>% head(20)
+  top_scores<-newadjustedscore[q,new_ord_numeric]
+  
+  #Optional line to plot the sorted scores as a monotonically decreasing line
+  
+  # plot(newadjustedscore[new_ord_numeric],type="l",xlab="Function",ylab="Score")
+  
+  #Add the current guild (top 5 functions) to the full guild table
+  add_guild<-new_ord[c(1:5)]
+  add_guild<-c(paste("Guild",q),add_guild)
+  forpub_guildtables[q,]<-add_guild
+  
+  #This section of code is optional for generating heatmaps of the presence/absence of the score-ordered functions in the probabilistic reps
+  
+  # repmatrix<-as.matrix(MAGData[reps,new_ord_numeric])
+  # heatmap(repmatrix,Rowv=NA,Colv=NA,scale="none",col=c("blue","red"),main="Within reps frequency")
+  
+  #Generate the information on full mapbacks using definition of guilds as the top 5 scoring functions
+  mapback_num<-5
+  mapback_func<-new_ord_numeric %>% head(mapback_num)
+  #Comparing number of mapbacks between probabilistic reps and full dataset
+  full_mapbacks<-which(rowSums(MAGData[reps,mapback_func])==mapback_num)
+  alldata_mapbacks<-which(rowSums(MAGData[,mapback_func])==mapback_num)
+  mapback_list[[q]]<-alldata_mapbacks
+  
+  store_mapbacks<-rbind(store_mapbacks,c(length(full_mapbacks),length(alldata_mapbacks)))
+}
+#Need to store the mapback values for Supplemental Table 7
+mapbacks_K10<-store_mapbacks[,2]
+
+#temporary line for saving publication table files
+guildtables_composite_df<-as.data.frame(forpub_guildtables)
+knitr::kable(guildtables_composite_df,
+             col.names=rep("",6),
+             caption = "Supplemental Table 4: Guilds for the composite dataset as defined by the top 5 functions in each aspect")
+
+##Now we will manually extract out the two guilds that we present in the main text in Table 1
+maintext_guilds<-cbind(order(newadjustedscore[2,],decreasing=TRUE),order(newadjustedscore[3,],decreasing=TRUE))%>%.[1:15,]
+maintext_guilds_table<-matrix(data=NA,nrow=15,ncol=2)
+maintext_guilds_table[,1]<-function_names[maintext_guilds[,1]]
+maintext_guilds_table[,2]<-function_names[maintext_guilds[,2]]
+maintext_guilds_df<-as.data.frame(maintext_guilds_table)
+colnames(maintext_guilds_df)<-c("Motility Guild","DMSP Guild")
+
+knitr::kable(maintext_guilds_df,
+             col.names=rep("",2),
+             caption="Table 1: DMSP and motility guilds presented together in Table 1 of the main text.")
+
+##This code generates mapback lines for all factors. Works down top 20 functions adding in one more function at a time and finding the new number of mapback genomes
+repmat<-matrix(data=0,nrow=K,ncol=20)
+for (i in 1:K){
+  top20positions<-newadjustedscore[i,]%>%order(decreasing=TRUE)%>%head(20)
+  for (j in 1:length(top20positions)){
+    currguild<-top20positions[1:j]
+    if (j==1){
+      reps<-which(data[,currguild]==length(currguild))
+      numreps<-length(reps)
+    } else {
+      reps<-which(rowSums(data[,currguild])==length(currguild))
+      numreps<-length(reps)
+    }
+    repmat[i,j]<-numreps
+  }
+}
+rep_df<-as_tibble(repmat)
+colnames(rep_df)<-c(1:20)
+rep_df<-rep_df%>%mutate(Guild=paste("Guild",c("A","B","C","D","E","F","G","H","I","J")))
+rep_melt<-melt(rep_df,id.vars="Guild")
+rep_melt$variable<-as.numeric(as.character(rep_melt$variable))
+colnames(rep_melt)[2:3]<-c("Number of Functions (Guild Size)","Number of Mapback Genomes")
+
+#Now plot the mapback lines
+print("Figure 3: Mapback lines for our 10-guild model as we expand from guild size 2 to guild size 20")
+print(ggplot(rep_melt,aes(x=`Number of Functions (Guild Size)`,y=`Number of Mapback Genomes`,group=Guild))+geom_line(aes(color=Guild))+theme(axis.text=element_text(size=7),legend.text=element_text(size=6),legend.title=element_text(size=6),axis.title=element_text(size=7),panel.background=element_blank(),panel.border=element_rect(fill=NA,color="black"),panel.grid.major=element_line(color="gray92"),panel.grid.minor=element_line(color="gray92"),legend.key=element_rect(fill=NA)))
+
+#Now we want to replicate Figure 7 from the main text with mapback information from the Aspect Bernoulli and clustergram
+L1_mapbacks<-cbind(c(12,66,4,2,2,4,2,12,3,2,33,12,3,7,6,15,3),c(0,0,0,17,3,1,9,2,1,16,0,1,1,0,0,0,3),"Linkage 1")
+L9_mapbacks<-cbind(c(3,2,3,3,42,5,5,13,2,2,2,3,2,4,7,2,18,7,7,6,3,2,2,2,3,2,4,3,11,3),c(7,146,70,28,4,54,19,8,25,4,17,26,9,17,11,16,4,35,27,19,157,7,3,28,34,13,8,354,12,3),"Linkage 0.9")
+fixedsize_mapbacks<-cbind(5,store_mapbacks[,2],"AB approach 1")
+
+genomecutoff<-100
+guildsizes<-c(); cutoff_reps<-c()
+for (i in 1:K){
+  #Find the size of guild that satisfies the min rep cutoff
+  numreps<-genomecutoff
+  guildsize<-2
+  guildloc<-newadjustedscore[i,]%>%order(decreasing = TRUE)%>%head(guildsize)
+  while(numreps>=genomecutoff){
+    prevreps<-numreps
+    lastreps<-reps
+    guildsize<-guildsize+1
+    prev_func<-guildloc
+    guildloc<-newadjustedscore[i,]%>%order(decreasing = TRUE)%>%head(guildsize)
+    reps<-which(rowSums(data[,guildloc])==length(guildloc))
+    numreps<-length(reps)
+  }
+  cutoff_reps<-c(cutoff_reps,prevreps)
+  guildsize<-guildsize-1
+  guildsizes<-c(guildsizes,guildsize)
+}
+genomecutoff_mapbacks<-cbind(guildsizes,cutoff_reps,"AB approach 2")
+
+all_mapbacks<-rbind(L9_mapbacks,L1_mapbacks,fixedsize_mapbacks,genomecutoff_mapbacks)%>%as.data.frame()
+colnames(all_mapbacks)<-c("Guild Sizes","Number of Mapback Genomes","Guild Type")
+
+ggplot(all_mapbacks,aes(x=as.numeric(`Guild Sizes`),y=as.numeric(`Number of Mapback Genomes`),group=`Guild Type`))+geom_point(position=position_jitter(height=0.1,width=0.35,seed=123),aes(shape=`Guild Type`,color=`Guild Type`),size=1.5)+xlab("Guild Size")+ylab("Number of Mapback Genomes")+theme(axis.text=element_text(size=5),legend.text=element_text(size=5),legend.title=element_text(size=5),axis.title=element_text(size=5),panel.background=element_blank(),panel.border=element_rect(fill=NA,color="black"),panel.grid.major=element_line(color="gray92"),panel.grid.minor=element_line(color="gray92"),legend.position=c(0.95,0.95),legend.box="vertical",legend.key=element_rect(fill=NA),legend.box.background = element_rect(fill="white",color="black"),legend.justification = c(1,1))+guides(shape=guide_legend(override.aes=list(size=1.25)))
+
+#Another quick code that is just for generating a figure, manually generating the DMSP market basket style heatmap plot
+heatmat<-matrix(data=0,nrow=4,ncol=4)
+diag(heatmat)<-NaN
+guildloc<-newadjustedscore[3,]%>%order(decreasing = TRUE)%>%head(20)
+guildloc<-guildloc[c(1,2,3,15)]
+funccomb<-t(combn(4,2))
+reps<-which(rowSums(data[,guildloc])==length(guildloc))
+nonrep_data<-data[-reps,]
+for (comb in 1:dim(funccomb)[1]){
+  funcpos<-guildloc[funccomb[comb,]]
+  forwardconf<-length(which(rowSums(nonrep_data[,funcpos])==2))/sum(nonrep_data[funcpos[1]])
+  reverseconf<-length(which(rowSums(nonrep_data[,funcpos])==2))/sum(nonrep_data[funcpos[2]])
+  heatmat[funccomb[comb,1],funccomb[comb,2]]<-forwardconf
+  heatmat[funccomb[comb,2],funccomb[comb,1]]<-reverseconf
+}
+axis_names<-c("DmdA","ddd*","soeABC","S2O3 ox")
+rownames(heatmat)<-axis_names; colnames(heatmat)<-axis_names
+#Plot the heatmap of the manually extracted DMSP guild
+print("Figure 4: Heatmap of the DMSP guild as defined in the main text and shown in Table 1")
+print(drawmat_precise(heatmat,ylab='',xlab=''))
+
+#Run NMDS on our dataset
+media_NMDS<-metaMDS(data,k=2,trymax=50)
+
+points_df<-as_tibble(media_NMDS$species)
+
+print(ggplot(points_df,aes(x=MDS1,y=MDS2))+geom_point(color="blue",alpha=0.5,size=0.5)+theme(axis.text=element_text(size=8),axis.title=element_text(size=8),plot.title=element_text(size=8),panel.background = element_blank(),panel.border=element_rect(fill=NA,color="black"),panel.grid.major = element_line(color="gray92"),panel.grid.minor=element_line(color="gray92"))+ggtitle("NMDS of composite dataset"))
+
+#Small chunk of semi-manual code based off AAI information for SCG genesets for fulldataset, requires a mapback_list object with mapback genomes and to read in the AAI matrix
+aai_matrix<-read.csv("Data/FastAAI_matrix.txt",sep="\t")%>%as.matrix()
+aai_matrix<-aai_matrix[,-1]
+
+set.seed(123)
+
+storevals<-c()
+for (i in 1:1000){
+  genomes<-sample(c(1:dim(data)[1]),size=100,replace=FALSE)
+  sub_aai<-aai_matrix[genomes,genomes]
+  sub_vec<-c(sub_aai[upper.tri(sub_aai)],sub_aai[lower.tri(sub_aai)])%>%as.numeric()
+  zero_entries<-which(sub_vec==0)
+  fifteen_entries<-which(sub_vec==15)
+  remove_entries<-c(zero_entries,fifteen_entries)
+  if (is_empty(remove_entries)==FALSE){
+    mean_val<-sub_vec[-remove_entries]%>%mean()
+  } else {
+    mean_val<-mean(sub_vec)
+  }
+
+  storevals<-c(storevals,mean_val)
+}
+
+guildvals<-c()
+for (i in 1:10){
+  genomes<-mapback_list[[i]]
+  sub_aai<-aai_matrix[genomes,genomes]
+  sub_vec<-c(sub_aai[upper.tri(sub_aai)],sub_aai[lower.tri(sub_aai)])%>%as.numeric
+  zero_entries<-which(sub_vec==0)
+  fifteen_entries<-which(sub_vec==15)
+  remove_entries<-c(zero_entries,fifteen_entries)
+  if (is_empty(remove_entries)==FALSE){
+    mean_val<-sub_vec[-remove_entries]%>%mean()
+  } else {
+    mean_val<-mean(sub_vec)
+  }
+  guildvals<-c(guildvals,mean_val)
+}
+#Add in the High ANI value as well
+guildvals<-c(guildvals,50.6971)
+guild_df<-as_tibble(guildvals)
+guild_df<-mutate(guild_df,Guilds=c(paste("Guild",c(1:10)),"High ANI"))
+
+#ggplot function to plot the results
+print("Supplemental Figure 6: Monte Carlo style simulations of size 100 random genome subsets:")
+
+print(ggplot(as_tibble(storevals),aes(x=value))+geom_histogram(fill="white",color="black",binwidth=0.1)+labs(title="Random AAI subsets",x="AAI Value",y="Frequency (Counts)",legend="Legend")+geom_vline(data=guild_df,aes(xintercept=value,color=Guilds),alpha=0.75,linewidth=1)+scale_x_break(c(41,50),ticklabels=c(50))+theme_bw())
+```
+
+Finally, we need to run our 5-guild model and 20-guild model for the composite dataset in order to regenerate **Supplemental Table 7** which shows the number of mapback genomes for each guild from the 5, 10, and 20 guild models. We'll start by running the 5-guild model.
+
+```{r mapback-table, results="asis"}
+##Lastly need to generate runs at K=5,20 to replicate a supplemental table
+##Running the AB on our composite dataset at K=5
+K=5
+
+data<-read_csv("Data/MAGData.csv") #%>% as.matrix()
+#Now need to run Aspect Bernoulli on this new dataset
+#The following line is a check to see if any of the data columns are full ones, if they are then they can cause the AB to fail and so those functions will be removed (with a text warning flag)
+fullones<-which(colSums(data)==dim(data)[1])
+if (is_empty(fullones)==FALSE){
+  data<-data[,-fullones]
+  print(paste("Function(s)",colnames(data)[fullones],"was/were removed because every genome had it (this can cause methodological error)"))
+}
+
+#Set a random seed to use, need to change the RNG kind so that it passes through the aspect bernoulli correctly
+RNGkind("L'Ecuyer-CMRG")
+set.seed(123)
+#Run the Aspect Bernoulli
+fit<-aspect_bernoulli(data,k=K,num_init=10,num_steps=num_steps,em_alg=em_fast,mc.cores=mc.cores)
+dat<-data
+
+#Extract the model which had the highest value for our objective function
+ibest <- fit %>% map_dbl(~ .x$obj[length(.x$obj)]) %>% which.max()
+bestfit = fit[[ibest]]
+
+##Extract the beta and gamma matrices from the best fitting model and format
+beta = bestfit$beta 
+Gamma =  bestfit$gamma
+colnames(beta) <- colnames(dat)
+FF = ncol(beta)
+G = nrow(Gamma)
+K = nrow(beta)
+
+## Add row and column names
+rownames(Gamma) <- 1:G
+colnames(Gamma) <- 1:K
+rownames(beta) <- 1:K
+
+## Calculate guild probabilities
+Vmult = Gamma %*% beta
+guild_prob_all = array(NA, dim = c(G, K, FF))
+for(f in 1:FF){
+  for(g in 1:G){
+    numers_by_guild = Gamma[g,] * beta[,f]
+    denom = Vmult[g,f]
+    if(denom==0) denom = denom + 1E-10
+    ratio = numers_by_guild/denom
+    guild_prob_all[g,,f] = ratio
+  }
+}
+dimnames(guild_prob_all)[[1]] <- 1:G
+dimnames(guild_prob_all)[[2]] <- 1:K
+dimnames(guild_prob_all)[[3]] <- colnames(beta)
+
+guild_prob = guild_prob_all %>% apply(c(2,3), mean)
+dimnames(guild_prob) = dimnames(beta)
+
+## Calculate the unadjusted function scores, q_fk in the main text (Eq. 5)
+numer = guild_prob
+baseline_probs = Gamma %>% colMeans()
+denom = matrix(baseline_probs, nrow=nrow(beta), ncol=ncol(beta), byrow=FALSE)
+stopifnot(dim(numer) == dim(denom))
+score = numer/denom
+
+## Get the top 30 functions in each aspect.
+function_names = colnames(dat)
+num = 30
+inds <- apply(Gamma, 1, function(myrow){ any(myrow > 0.95)})
+mapbacks_guild <- colSums(round(Gamma[inds, ]))
+baseline_probs <- colMeans(Gamma)
+ScoreMat <- matrix(nrow = num, ncol = K, data = 0)
+for(guild in 1:K){
+  ord = score[guild,] %>% order(decreasing = TRUE) %>% head(num)
+  ScoreMat[,guild] <- score[guild, ord]
+}
+
+#--------------------------------------------------------------------------------------------------------------#
+#Establish some variables and empty matrices that we will use to score our final score (see Methods) as well as the mapback genome numbers for our guilds
+MAGData <- dat
+newadjustedscore <- matrix(data = 0, nrow = K, ncol = length(function_names))
+store_mapbacks <- matrix(data = 0, nrow = 0, ncol = 2)
+#Find the maximum Gamma value for each genome, which determines which aspect that genome is a probabilistic representative for (defined in Methods)
+Gamma_maxes <- max.col(Gamma, ties.method = "random")
+avg_fulldata_abundance <- mean(colSums(MAGData))
+
+#This is an optional variable for creating a table of the guilds as defined by the top 5 functions in each aspect
+forpub_guildtables<-matrix(data=NA,nrow=K,ncol=6)
+for (q in 1:dim(Gamma)[2]){
+  reps <- which(Gamma_maxes == q)
+  names(reps) <- c() 
+  #To avoid instances of ties or near ties between two aspects, we remove any genomes from the probabilistic reps list if the maximum Gamma value for that genome falls below 2*(1/K)
+  low_reps <- which(Gamma[reps,q] < (2*(1/K)))
+  if(is_empty(low_reps)==FALSE){
+    reps<-reps[-low_reps]
+  }
+  #Optionally you can print the number of reps discarded, but we have found this number to be 0 or very nearly 0
+  
+  # print(paste("Number of reps discarded is",length(low_reps)))
+                                        # cat("\n")
+  
+  #As described in Equations 5 & 6 in the main text, we need to compute an abundance adjustment factor that promotes functions present in more of the probabilistic reps for a given aspect
+  avg_ingroup_abundance<-mean(colSums(MAGData[reps,]))
+  normalize_repratio<-colSums(MAGData[reps,])/avg_ingroup_abundance
+  newadjustedscore[q,]<-score[q,]*normalize_repratio
+  
+  #This section of code can generate figures to compare pre and post abundance adjusted scores to show that top functions have many more reps after the adjustment
+  
+  # adjust_ord<-newadjustedscore[q,]%>%order(decreasing=TRUE) %>% head(75)
+  # orig_ord<-score[q,]%>%order(decreasing=TRUE) %>% head(75)
+  # 
+  # adjust_repfreq<-colSums(MAGData[reps,adjust_ord])/length(reps)
+  # orig_repfreq<-colSums(MAGData[reps,orig_ord])/length(reps)
+  # freq_df<-as_tibble(cbind(adjust_repfreq,orig_repfreq))
+  # freq_df<-mutate(freq_df,x=c(1:length(orig_ord)))
+  # colnames(freq_df)<-c("Adjusted Score","Original Score","Score Rank")
+  # freq_melt<-freq_df%>%melt(.,id.vars="Score Rank")
+  # colnames(freq_melt)[c(2,3)]<-c("Score Type","Within Rep Abundance")
+  
+  #This line will plot the scatters of the pre and post adjustment scores
+  
+  #print(ggplot(data=freq_melt,aes(x=`Score Rank`,y=`Within Rep Abundance`,color=`Score Type`)) + geom_point())
+  
+  #Save the names and scores in decreasing order for export
+  new_ord<-newadjustedscore[q,] %>% order(decreasing=TRUE) %>% head(20) %>% function_names[.]
+  new_ord_numeric<-newadjustedscore[q,] %>% order(decreasing=TRUE) %>% head(20)
+  top_scores<-newadjustedscore[q,new_ord_numeric]
+  
+  #Optional line to plot the sorted scores as a monotonically decreasing line
+  
+  # plot(newadjustedscore[new_ord_numeric],type="l",xlab="Function",ylab="Score")
+  
+  #Add the current guild (top 5 functions) to the full guild table
+  add_guild<-new_ord[c(1:5)]
+  add_guild<-c(paste("Guild",q),add_guild)
+  forpub_guildtables[q,]<-add_guild
+  
+  #This section of code is optional for generating heatmaps of the presence/absence of the score-ordered functions in the probabilistic reps
+  
+  # repmatrix<-as.matrix(MAGData[reps,new_ord_numeric])
+  # heatmap(repmatrix,Rowv=NA,Colv=NA,scale="none",col=c("blue","red"),main="Within reps frequency")
+  
+  #Generate the information on full mapbacks using definition of guilds as the top 5 scoring functions
+  mapback_num<-5
+  mapback_func<-new_ord_numeric %>% head(mapback_num)
+  #Comparing number of mapbacks between probabilistic reps and full dataset
+  full_mapbacks<-which(rowSums(MAGData[reps,mapback_func])==mapback_num)
+  alldata_mapbacks<-which(rowSums(MAGData[,mapback_func])==mapback_num)
+  
+  store_mapbacks<-rbind(store_mapbacks,c(length(full_mapbacks),length(alldata_mapbacks)))
+}
+#Store the mapback values for the full dataset for the 5-guild model
+mapbacks_K5<-store_mapbacks[,2]
+
+```
+
+Now finish with the 20-guild model.
+
+```{r 20guild-model, results="asis"}
+##Running the AB on our composite dataset at K=20
+K=20
+
+data<-read_csv("Data/MAGData.csv") #%>% as.matrix()
+#Now need to run Aspect Bernoulli on this new dataset
+#The following line is a check to see if any of the data columns are full ones, if they are then they can cause the AB to fail and so those functions will be removed (with a text warning flag)
+fullones<-which(colSums(data)==dim(data)[1])
+if (is_empty(fullones)==FALSE){
+  data<-data[,-fullones]
+  print(paste("Function(s)",colnames(data)[fullones],"was/were removed because every genome had it (this can cause methodological error)"))
+}
+
+#Set a random seed to use, need to change the RNG kind so that it passes through the aspect bernoulli correctly
+RNGkind("L'Ecuyer-CMRG")
+set.seed(123)
+#Run the Aspect Bernoulli
+fit<-aspect_bernoulli(data,k=K,num_init=10,num_steps=num_steps,em_alg=em_fast,mc.cores=mc.cores)
+dat<-data
+
+#Extract the model which had the highest value for our objective function
+ibest <- fit %>% map_dbl(~ .x$obj[length(.x$obj)]) %>% which.max()
+bestfit = fit[[ibest]]
+
+##Extract the beta and gamma matrices from the best fitting model and format
+beta = bestfit$beta 
+Gamma =  bestfit$gamma
+colnames(beta) <- colnames(dat)
+FF = ncol(beta)
+G = nrow(Gamma)
+K = nrow(beta)
+
+## Add row and column names
+rownames(Gamma) <- 1:G
+colnames(Gamma) <- 1:K
+rownames(beta) <- 1:K
+
+## Calculate guild probabilities
+Vmult = Gamma %*% beta
+guild_prob_all = array(NA, dim = c(G, K, FF))
+for(f in 1:FF){
+  for(g in 1:G){
+    numers_by_guild = Gamma[g,] * beta[,f]
+    denom = Vmult[g,f]
+    if(denom==0) denom = denom + 1E-10
+    ratio = numers_by_guild/denom
+    guild_prob_all[g,,f] = ratio
+  }
+}
+dimnames(guild_prob_all)[[1]] <- 1:G
+dimnames(guild_prob_all)[[2]] <- 1:K
+dimnames(guild_prob_all)[[3]] <- colnames(beta)
+
+guild_prob = guild_prob_all %>% apply(c(2,3), mean)
+dimnames(guild_prob) = dimnames(beta)
+
+## Calculate the unadjusted function scores, q_fk in the main text (Eq. 5)
+numer = guild_prob
+baseline_probs = Gamma %>% colMeans()
+denom = matrix(baseline_probs, nrow=nrow(beta), ncol=ncol(beta), byrow=FALSE)
+stopifnot(dim(numer) == dim(denom))
+score = numer/denom
+
+## Get the top 30 functions in each aspect.
+function_names = colnames(dat)
+num = 30
+inds <- apply(Gamma, 1, function(myrow){ any(myrow > 0.95)})
+mapbacks_guild <- colSums(round(Gamma[inds, ]))
+baseline_probs <- colMeans(Gamma)
+ScoreMat <- matrix(nrow = num, ncol = K, data = 0)
+for(guild in 1:K){
+  ord = score[guild,] %>% order(decreasing = TRUE) %>% head(num)
+  ScoreMat[,guild] <- score[guild, ord]
+}
+
+#--------------------------------------------------------------------------------------------------------------#
+#Establish some variables and empty matrices that we will use to score our final score (see Methods) as well as the mapback genome numbers for our guilds
+MAGData <- dat
+newadjustedscore <- matrix(data = 0, nrow = K, ncol = length(function_names))
+store_mapbacks <- matrix(data = 0, nrow = 0, ncol = 2)
+#Find the maximum Gamma value for each genome, which determines which aspect that genome is a probabilistic representative for (defined in Methods)
+Gamma_maxes <- max.col(Gamma, ties.method = "random")
+avg_fulldata_abundance <- mean(colSums(MAGData))
+
+#This is an optional variable for creating a table of the guilds as defined by the top 5 functions in each aspect
+forpub_guildtables<-matrix(data=NA,nrow=K,ncol=6)
+for (q in 1:dim(Gamma)[2]){
+  reps <- which(Gamma_maxes == q)
+  names(reps) <- c() 
+  #To avoid instances of ties or near ties between two aspects, we remove any genomes from the probabilistic reps list if the maximum Gamma value for that genome falls below 2*(1/K)
+  low_reps <- which(Gamma[reps,q] < (2*(1/K)))
+  if(is_empty(low_reps)==FALSE){
+    reps<-reps[-low_reps]
+  }
+  #Optionally you can print the number of reps discarded, but we have found this number to be 0 or very nearly 0
+  
+  # print(paste("Number of reps discarded is",length(low_reps)))
+                                        # cat("\n")
+  
+  #As described in Equations 5 & 6 in the main text, we need to compute an abundance adjustment factor that promotes functions present in more of the probabilistic reps for a given aspect
+  avg_ingroup_abundance<-mean(colSums(MAGData[reps,]))
+  normalize_repratio<-colSums(MAGData[reps,])/avg_ingroup_abundance
+  newadjustedscore[q,]<-score[q,]*normalize_repratio
+  
+  #This section of code can generate figures to compare pre and post abundance adjusted scores to show that top functions have many more reps after the adjustment
+  
+  # adjust_ord<-newadjustedscore[q,]%>%order(decreasing=TRUE) %>% head(75)
+  # orig_ord<-score[q,]%>%order(decreasing=TRUE) %>% head(75)
+  # 
+  # adjust_repfreq<-colSums(MAGData[reps,adjust_ord])/length(reps)
+  # orig_repfreq<-colSums(MAGData[reps,orig_ord])/length(reps)
+  # freq_df<-as_tibble(cbind(adjust_repfreq,orig_repfreq))
+  # freq_df<-mutate(freq_df,x=c(1:length(orig_ord)))
+  # colnames(freq_df)<-c("Adjusted Score","Original Score","Score Rank")
+  # freq_melt<-freq_df%>%melt(.,id.vars="Score Rank")
+  # colnames(freq_melt)[c(2,3)]<-c("Score Type","Within Rep Abundance")
+  
+  #This line will plot the scatters of the pre and post adjustment scores
+  
+  #print(ggplot(data=freq_melt,aes(x=`Score Rank`,y=`Within Rep Abundance`,color=`Score Type`)) + geom_point())
+  
+  #Save the names and scores in decreasing order for export
+  new_ord<-newadjustedscore[q,] %>% order(decreasing=TRUE) %>% head(20) %>% function_names[.]
+  new_ord_numeric<-newadjustedscore[q,] %>% order(decreasing=TRUE) %>% head(20)
+  top_scores<-newadjustedscore[q,new_ord_numeric]
+  
+  #Optional line to plot the sorted scores as a monotonically decreasing line
+  
+  # plot(newadjustedscore[new_ord_numeric],type="l",xlab="Function",ylab="Score")
+  
+  #Add the current guild (top 5 functions) to the full guild table
+  add_guild<-new_ord[c(1:5)]
+  add_guild<-c(paste("Guild",q),add_guild)
+  forpub_guildtables[q,]<-add_guild
+  
+  #This section of code is optional for generating heatmaps of the presence/absence of the score-ordered functions in the probabilistic reps
+  
+  # repmatrix<-as.matrix(MAGData[reps,new_ord_numeric])
+  # heatmap(repmatrix,Rowv=NA,Colv=NA,scale="none",col=c("blue","red"),main="Within reps frequency")
+  
+  #Generate the information on full mapbacks using definition of guilds as the top 5 scoring functions
+  mapback_num<-5
+  mapback_func<-new_ord_numeric %>% head(mapback_num)
+  #Comparing number of mapbacks between probabilistic reps and full dataset
+  full_mapbacks<-which(rowSums(MAGData[reps,mapback_func])==mapback_num)
+  alldata_mapbacks<-which(rowSums(MAGData[,mapback_func])==mapback_num)
+  
+  store_mapbacks<-rbind(store_mapbacks,c(length(full_mapbacks),length(alldata_mapbacks)))
+}
+#Save the mapback values for the 20-guild model
+mapbacks_K20<-store_mapbacks[,2]
+
+#Finally need to recreate Supplemental Table 7 with the mapback values at three different K values
+mapback_table<-matrix(data=0,nrow=20,ncol=3)
+mapback_table[c(1:5),1]<-mapbacks_K5; mapback_table[c(1:10),2]<-mapbacks_K10; mapback_table[,3]<-mapbacks_K20
+mapback_df<-as.data.frame(mapback_table)
+colnames(mapback_df)<-c("Number of Mapbacks (K=5)","Number of Mapbacks (K=10)","Number of Mapbacks (K=20)")
+
+knitr::kable(mapback_df, caption="This is Supplemental Table 7, presenting the mapback numbers at different values of K")
+
+```
+
+```{r this-is-the-end, eval=TRUE}
+knitr::knit_exit()
+```
