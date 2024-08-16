@@ -2,14 +2,14 @@
 library(argparser, quietly=TRUE)
 
 p <- arg_parser("Execute a run of the Aspect Bernoulli")
-p <- add_argument(p, "--data", help = "Provide the path to a csv-formatted binary annotation data file with inidividual samples in the row dimension and individual annotations in the column dimension", short = "-d")
-p <- add_argument(p, "--num_clusters", help = "Provide the number of clusters, or aspects, you wish to parse your annotation data into", default = 10, type = "numeric", short = "-c")
+p <- add_argument(p, "--data", help = "Provide the path to a csv-formatted binary annotation data file with inidividual samples in the row dimension and individual annotations in the column dimension.", short = "-d")
+p <- add_argument(p, "--num_guilds", help = "Provide the number of guilds, or aspects, you wish to parse your annotation data into.", default = 10, type = "numeric", short = "-c")
 p <- add_argument(p, "--seed", help = "Provide a random seed, otherwise the default seed is 123", default = 123, type = "numeric", short = "-s")
-p <- add_argument(p, "--num_init", help = "Number of independent initializations of the stochastic optimization to generate (at least 10 is recommended)", default = 10, type = "numeric", short ="-n")
-p <- add_argument(p, "--num_iter", help = "Number of iterations of the optimization problem to run per optimization run (NOTE: your runtime will scale on a power law with the size of your data, number of initializations, and number of iterations)", default = 2000, type = "numeric", short = "-i")
-p <- add_argument(p, "--cores", help = "If your machine has multiple cores, you can specify the number to use here (this will improve your runtime", default = 1, type = "numeric")
-p <- add_argument(p, "--output", help = "Specify a folder for all of the output files to be stored in. The default will be a subfolder from the current directory titled 'Output'", default = "Output", short = "-o")
-p <- add_argument(p, "--guild_size", help = "Specify the number of functions you want to use to describe each guild", default = 5)
+p <- add_argument(p, "--num_init", help = "Number of independent initializations of the stochastic optimization to generate (at least 10 is recommended).", default = 10, type = "numeric", short ="-n")
+p <- add_argument(p, "--num_iter", help = "Number of iterations of the optimization problem to run per optimization run (NOTE: your runtime will scale on a power law with the size of your data, number of initializations, and number of iterations).", default = 2000, type = "numeric", short = "-i")
+p <- add_argument(p, "--cores", help = "If your machine has multiple cores, you can specify the number to use here (this will improve your runtime).", default = 1, type = "numeric")
+p <- add_argument(p, "--output", help = "Specify a folder for all of the output files to be stored in. The default will be a subfolder within the current directory.", default = "Output", short = "-o")
+p <- add_argument(p, "--guild_size", help = "Specify the number of functions you want to use to describe each guild.", default = 5)
 
 argv <- parse_args(p)
 
@@ -25,7 +25,7 @@ library(tidyverse, quietly=TRUE)
 source("Codes/aspect_bernoulli.R")
 source("Codes/drawmat_precise.R")
 
-K = argv$num_clusters
+K = argv$num_guilds
 data<-read_csv(argv$data)
 seed = argv$seed
 
@@ -204,7 +204,7 @@ for (q in 1:dim(Gamma)[2]){
   printdata<-matrix(data=NA,nrow=length(new_ord),ncol=2)
   printdata[,1]<-new_ord; printdata[,2]<-top_scores
   colnames(printdata)<-c("Function","New_Score")
-  write.table(printdata,filename,append=TRUE,sep=",")
+  # write.table(printdata,filename,append=TRUE,sep=",")
 }
 #Export the full set of guild functions and scores
 all.guild.info <- all.guild.info %>% select(-index)
